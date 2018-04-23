@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"net"
 	"sync"
+	"syscall"
 	"time"
+	"os"
 
 	"github.com/leesper/holmes"
 )
@@ -271,6 +273,7 @@ type ClientConn struct {
 	pending   []int64
 	ctx       context.Context
 	cancel    context.CancelFunc
+	retryNum  int //number of retries is used to reconnection stat
 }
 
 // NewClientConn returns a new client connection which has not started to
@@ -374,6 +377,7 @@ func (cc *ClientConn) Start() {
 	}
 }
 
+// internal close only
 // Close gracefully closes the client connection. It blocked until all sub
 // go-routines are completed and returned.
 func (cc *ClientConn) Close() {
@@ -415,23 +419,73 @@ func (cc *ClientConn) Close() {
 		// be performed on an unlocked mutex(the newly-allocated one noticed above)
 		if cc.opts.reconnect {
 			cc.reconnect()
+			syscall.Kill(os.Getpid(), syscall.SIGUSR1)
 		}
+	})
+}
+
+// external close
+// Close gracefully closes the client connection. It blocked until all sub
+// go-routines are completed and returned.
+func (cc *ClientConn) Exit() {
+	cc.once.Do(func() {
+		holmes.Infof("conn exit gracefully, <%v -> %v>\n", cc.rawConn.LocalAddr(), cc.rawConn.RemoteAddr())
+
+		// callback on close
+		onClose := cc.opts.onClose
+		if onClose != nil {
+			onClose(cc)
+		}
+
+		// close net.conn, any blocked read or write operation will be unblocked and
+		// return errors.
+		cc.rawConn.Close()
+
+		// cancel readLoop, writeLoop and handleLoop go-routines.
+		cc.mu.Lock()
+		cc.cancel()
+		cc.pending = nil
+		cc.mu.Unlock()
+
+		// stop timer
+		cc.timing.Stop()
+		cc.timing = nil
+
+		// wait until all go-routines exited.
+		cc.wg.Wait()
+
+		// close all channels.
+		close(cc.sendCh)
+		close(cc.handlerCh)
 	})
 }
 
 // reconnect reconnects and returns a new *ClientConn.
 func (cc *ClientConn) reconnect() {
+	if cc.retryNum >= cc.opts.retryNum {
+		holmes.Fatalln("the number of reconnect is out of range")
+	}
+
+	holmes.Infof("start reconnect after sleep time %ds", cc.opts.waitTime)
+	time.Sleep(time.Duration(cc.opts.waitTime) * time.Second)
+
+	cc.retryNum++
+	holmes.Infof("begin %d times reconnect", cc.retryNum)
 	var c net.Conn
 	var err error
 	if cc.opts.tlsCfg != nil {
 		c, err = tls.Dial("tcp", cc.addr, cc.opts.tlsCfg)
 		if err != nil {
-			holmes.Fatalln("tls dial error", err)
+			holmes.Errorln("tls dial error", err)
+			cc.reconnect()
+			return
 		}
 	} else {
 		c, err = net.Dial("tcp", cc.addr)
 		if err != nil {
-			holmes.Fatalln("net dial error", err)
+			holmes.Errorln("net dial error", err)
+			cc.reconnect()
+			return
 		}
 	}
 	// copy the newly-created *ClientConn to cc, so after

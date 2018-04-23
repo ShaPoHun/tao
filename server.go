@@ -32,15 +32,19 @@ type options struct {
 	workerSize int  // numbers of worker go-routines
 	bufferSize int  // size of buffered channel
 	reconnect  bool // for ClientConn use only
+	waitTime   int  // waiting for reconnect is ClientConn used only
+	retryNum   int  //number of retries is ClientConn used only
 }
 
 // ServerOption sets server options.
 type ServerOption func(*options)
 
 // ReconnectOption returns a ServerOption that will make ClientConn reconnectable.
-func ReconnectOption() ServerOption {
+func ReconnectOption(waitTime, retryNum int) ServerOption {
 	return func(o *options) {
 		o.reconnect = true
+		o.waitTime = waitTime
+		o.retryNum = retryNum
 	}
 }
 
